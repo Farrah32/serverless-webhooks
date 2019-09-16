@@ -1,63 +1,75 @@
-const crypto = require('crypto');
-// This function will validate your payload from GitHub
-// See docs at https://developer.github.com/webhooks/securing/#validating-payloads-from-github
-function signRequestBody(key, body) {
-  return `sha1=${crypto.createHmac('sha1', key).update(body, 'utf-8').digest('hex')}`;
-}
-// The webhook handler function
-exports.githubWebhookHandler = async event => {
-  // get the GitHub secret from the environment variables
-  const token = process.env.GITHUB_WEBHOOK_SECRET;
-  const calculatedSig = signRequestBody(token, event.body);
-  let errMsg;
-  // get the remaining variables from the GitHub event
-  const headers = event.headers;
-  const sig = headers['X-Hub-Signature'];
-  const githubEvent = headers['X-GitHub-Event'];
-  const body = JSON.parse(event.body);
-  // this determines username for a push event, but lists the repo owner for other events
-  const username = body.pusher ? body.pusher.name : body.repository.owner.login;
-  const message = body.pusher ? `${username} pushed this awesomeness/atrocity through (delete as necessary)` : `The repo owner is ${username}.`
-  // get repo variables
-  const { repository } = body;
-  const repo = repository.full_name;
-  const url = repository.url;
-  
-  // check that a GitHub webhook secret variable exists, if not, return an error
-  if (typeof token !== 'string') {
-    errMsg = 'Must provide a \'GITHUB_WEBHOOK_SECRET\' env variable';
+const AWS = require('aws-sdk');
+const secrets = new AWS.SecretsManager();
+const rp = require('request-promise');
+const md5 = require('md5');
+const { sendRollbarError } = require('utils');
+let mailChimpKey;
+
+exports.handler = async (event, context) => {
+  // Log the event argument for debugging and for use in local development.
+  console.log(JSON.stringify(event, undefined, 2));
+
+  try {
+    const response = await mailchimpFunction(event);
+
     return {
-      statusCode: 401,
-      headers: { 'Content-Type': 'text/plain' },
-      body: errMsg,
+      statusCode: 200,
+      headers: {},
+      body: JSON.stringify(response)
     };
+  } catch (error) {
+    // Send a Rollbar error if an error occurs anywhere in the function
+    await sendRollbarError(process.env.ROLLBAR_TOKEN, process.env.ENV, error.message, error);
+    throw error;
   }
-  // check validity of GitHub token
-  if (sig !== calculatedSig) {
-    errMsg = 'X-Hub-Signature incorrect. Github webhook token doesn\'t match';
-    return {
-      statusCode: 401,
-      headers: { 'Content-Type': 'text/plain' },
-      body: errMsg,
-    };
-  }
-
-  // print some messages to the CloudWatch console
-  console.log('---------------------------------');
-  console.log(`\nGithub-Event: "${githubEvent}" on this repo: "${repo}" at the url: ${url}.\n ${message}`);
-  console.log('Contents of event.body below:');
-  console.log(event.body);
-  console.log('---------------------------------');
-
-  // more advanced logic can go here
-  
-  // return a 200 response if the GitHub tokens match
-  const response = {
-    statusCode: 200,
-    body: JSON.stringify({
-      input: event,
-    }),
-  };
-
-  return response;
 };
+
+const mailchimpFunction = async (event) => {
+  const notification = JSON.parse(event.Records[0].body);
+  const type = notification.MessageAttributes.type.Value;
+  const payload = JSON.parse(notification.Message);
+  const mailChimpAudience = process.env.MAILCHIMP_AUDIENCE;
+
+  const hashedEmail = md5(payload.email.toLowerCase());
+
+  if (!mailChimpKey) {
+    try {
+      const { SecretString } = await secrets.getSecretValue({ SecretId: `${process.env.SECRETS_NAMESPACE}mailchimp-api-key` }).promise();
+      mailChimpKey = SecretString;
+    } catch (error) {
+      console.error(`ERROR GETTING SECRET: ${JSON.stringify(error, undefined, 2)}`);
+      throw error;
+    }
+  }
+  
+  if (type !== 'deployed-3x') {
+    console.log(`UNHANDLED EVENT TYPE: ${type}`);
+    return;
+  }
+  
+  try {
+    const response = await rp({
+      method: 'post',
+      headers: { Authorization: `Bearer ${mailChimpKey}` },
+      uri: `https://us18.api.mailchimp.com/3.0/lists/${mailChimpAudience}/members`,
+      json: true,
+      body: {
+        'email_address': payload.email,
+        'status': 'subscribed',
+        'merge_fields': {
+          'FNAME': payload.firstName,
+          'LNAME': payload.lastName
+        },
+        tags: [ 'send-swag' ]
+      }
+    });
+    
+    console.log(`${type.toUpperCase()} SUCCESS: ${JSON.stringify(response, undefined, 2)}`);
+    
+    return response;
+  } catch (error) {
+    console.error(`${type.toUpperCase()} ERROR: ${JSON.stringify(error, undefined, 2)}`);
+    
+    throw error;
+  }
+}
