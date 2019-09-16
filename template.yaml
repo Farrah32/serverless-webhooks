@@ -1,33 +1,44 @@
 AWSTemplateFormatVersion: 2010-09-09
 Transform: AWS::Serverless-2016-10-31
 Resources:
-  listenForWebhook:
-    Type: AWS::Serverless::Api
+  UsageEvents:
+    Type: AWS::SNS::Topic
     Properties:
-      Name: !Sub
-        - ${ResourceName} From Stack ${StackTagName} Environment ${EnvironmentTagName}
-        - ResourceName: listenForWebhook
-      StageName: !Ref EnvironmentAPIGatewayStageName
-      DefinitionBody:
-        swagger: '2.0'
-        info: {}
-        paths:
-          /webhook:
-            post:
-              x-amazon-apigateway-integration:
-                httpMethod: POST
-                type: aws_proxy
-                uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${handleWebhook.Arn}/invocations
-              responses: {}
-      EndpointConfiguration: REGIONAL
-      TracingEnabled: true
-  handleWebhook:
+      TopicName: !Sub ${AWS::StackName}-UsageEvents
+      Subscription:
+        - Endpoint: !GetAtt MailChimpTagQueue.Arn
+          Protocol: sqs
+    Condition: UsageEventsCreateNewResource
+  MailChimpTagQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-MailChimpTagQueue
+  UsageEventsToMailChimpTagQueuePermission:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt MailChimpTagQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !If
+                  - UsageEventsUseExistingResource
+                  - !Ref UsageEventsExistingResource
+                  - !Ref UsageEvents
+      Queues:
+        - !Ref MailChimpTagQueue
+  MailChimpTagUser:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: !Sub ${AWS::StackName}-handleWebhook
+      FunctionName: !Sub ${AWS::StackName}-MailChimpTagUser
       Description: !Sub
         - Stack ${StackTagName} Environment ${EnvironmentTagName} Function ${ResourceName}
-        - ResourceName: handleWebhook
+        - ResourceName: MailChimpTagUser
       CodeUri: src/handleWebhook
       Handler: index.githubWebhookHandler
       Runtime: nodejs10.x
@@ -36,16 +47,25 @@ Resources:
       Tracing: Active
       Policies:
         - AWSXrayWriteOnlyAccess
-      Events:
-        listenForWebhookPOSTwebhook:
-          Type: Api
-          Properties:
-            Path: /webhook
-            Method: POST
-            RestApiId: !Ref listenForWebhook
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/${EnvironmentTagName}/*
       Environment:
         Variables:
           GITHUB_WEBHOOK_SECRET: !Ref EnvConfiggithubSecretAsString
+          SECRETS_NAMESPACE: !Sub /${EnvironmentTagName}/
+      Events:
+        MailChimpTagQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt MailChimpTagQueue.Arn
+            BatchSize: 1
+  UsageEventsExistingResource:
+    Type: Custom::StackeryExistingResource
+    Properties:
+      ServiceToken: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stackery-agent-commander
+      Type: topic
+      Data: !Ref EnvConfigUsageEventsTopicArnAsString
+    Condition: UsageEventsUseExistingResource
 Parameters:
   StackTagName:
     Type: String
@@ -53,12 +73,19 @@ Parameters:
   EnvironmentTagName:
     Type: String
     Description: Environment Name (injected by Stackery at deployment time)
-  EnvironmentAPIGatewayStageName:
-    Type: String
-    Description: Environment name used for API Gateway Stage names (injected by Stackery at deployment time)
   EnvConfiggithubSecretAsString:
     Type: AWS::SSM::Parameter::Value<String>
     Default: /<EnvironmentName>/githubSecret
+  EnvConfigUsageEventsTopicArnAsString:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /<EnvironmentName>/UsageEventsTopicArn
 Metadata:
   EnvConfigParameters:
     EnvConfiggithubSecretAsString: githubSecret
+    EnvConfigUsageEventsTopicArnAsString: UsageEventsTopicArn
+Conditions:
+  UsageEventsCreateNewResource: !Equals
+    - 'false'
+    - !Ref EnvConfigUsageEventsTopicArnAsString
+  UsageEventsUseExistingResource: !Not
+    - Condition: UsageEventsCreateNewResource
