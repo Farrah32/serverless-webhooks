@@ -39,7 +39,7 @@ Resources:
       Description: !Sub
         - Stack ${StackTagName} Environment ${EnvironmentTagName} Function ${ResourceName}
         - ResourceName: MailChimpTagUser
-      CodeUri: src/handleWebhook
+      CodeUri: src/MailChimpTagUser
       Handler: index.githubWebhookHandler
       Runtime: nodejs10.x
       MemorySize: 3008
